@@ -16,10 +16,16 @@ from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-cred = credentials.Certificate("capstone-ad4dc-firebase-adminsdk-fbsvc-3005a411f0.json")
-firebase_admin.initialize_app(cred, {
-    'databaseURL': 'https://capstone-ad4dc-default-rtdb.firebaseio.com/'
-})
+if not firebase_admin._apps:
+    cred = credentials.Certificate("capstone-ad4dc-firebase-adminsdk-fbsvc-3005a411f0.json")
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://capstone-ad4dc-default-rtdb.firebaseio.com/'
+    })
+# cred = credentials.Certificate("capstone-ad4dc-firebase-adminsdk-fbsvc-3005a411f0.json")
+
+# firebase_admin.initialize_app(cred, {
+#     'databaseURL': 'https://capstone-ad4dc-default-rtdb.firebaseio.com/'
+# })
 db = firestore.client()
 
 # --- FastAPI Setup ---
@@ -58,14 +64,29 @@ async def extract_text_and_save(image: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="File bukan gambar yang valid")
 
         # Run OCR
+        img = deskew_image(img)
         pil_img = Image.open(io.BytesIO(contents))
-        text = pytesseract.image_to_string(pil_img, lang="ind+eng")
+        # --- OCR Preprocessing ---
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        gray = cv2.medianBlur(gray, 3)
+        # optional dilation/erosion for thin fonts
+        kernel = np.ones((1, 1), np.uint8)
+        gray = cv2.dilate(gray, kernel, iterations=1)
+        gray = cv2.erode(gray, kernel, iterations=1)
+
+        # Convert back to PIL for pytesseract
+        processed_pil = Image.fromarray(gray)
+        cv2.imwrite("processed_image.png", gray)  # for debugging
+        text = run_best_ocr(processed_pil)
+
 
         if not text.strip():
             raise HTTPException(status_code=400, detail="Tidak ada teks yang terdeteksi pada gambar.")
 
         lines = [l.strip() for l in text.splitlines() if l.strip()]
-
+        lines = [re.sub(r'[^0-9A-Za-z.,:/\-() ]+', '', l) for l in lines]
+        lines = [re.sub(r'\s{2,}', ' ', l).strip() for l in lines]
         # Extract structured data
         merchant = extract_merchant(lines)
         date_str = extract_date(lines)
@@ -102,12 +123,14 @@ async def extract_text_and_save(image: UploadFile = File(...)):
 # ============================================================
 
 def extract_merchant(lines):
-    """Detect possible merchant name (top or bottom)."""
-    candidates = lines[:5] + lines[-5:]
-    for l in candidates:
-        if any(k in l.lower() for k in ["toko", "mart", "pt", "indomaret", "alfamart", "malang", "market", "co", "minimarket"]):
+    for l in lines:
+        if any(k in l.lower() for k in ["toko", "mart", "minimarket", "pt", "indomaret", "alfamart", "market", "co", "bengkel", "warung"]):
             return l
-    return candidates[0] if candidates else None
+    # fallback: first non-numeric line
+    for l in lines:
+        if not re.search(r'\d', l):
+            return l
+    return None
 
 
 def extract_date(lines):
@@ -121,14 +144,12 @@ def extract_date(lines):
 
 
 def extract_total(lines):
-    """Detect 'total belanja' or 'harga jual'."""
     for l in reversed(lines):
-        if re.search(r'total|harga jual|jumlah|total belanja', l.lower()):
-            match = re.search(r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{0,2})?)', l)
+        if re.search(r'total( belanja| harga|)$', l.lower()):
+            match = re.search(r'(\d{1,3}(?:[.,]\d{3})+)', l)
             if match:
                 return match.group(1)
     return None
-
 
 def extract_cash(lines):
     """Detect 'tunai' or 'cash'."""
@@ -165,3 +186,25 @@ def extract_items(lines):
             except:
                 continue
     return items
+
+def deskew_image(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    coords = np.column_stack(np.where(gray < 255))
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    (h, w) = img.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+def run_best_ocr(img):
+    best_text = ""
+    for mode in [4, 6, 11]:
+        text = pytesseract.image_to_string(img, lang="ind+eng", config=f"--psm {mode}")
+        if len(text) > len(best_text):
+            best_text = text
+    return best_text
+
