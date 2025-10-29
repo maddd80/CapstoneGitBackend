@@ -60,25 +60,46 @@ async def extract_text_and_save(image: UploadFile = File(...)):
         contents = await image.read()
         np_img = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
-        if img is None:
-            raise HTTPException(status_code=400, detail="File bukan gambar yang valid")
+        # if img is None:
+        #     raise HTTPException(status_code=400, detail="File bukan gambar yang valid")
 
         # Run OCR
-        img = deskew_image(img)
-        pil_img = Image.open(io.BytesIO(contents))
-        # --- OCR Preprocessing ---
+        # img = deskew_image(img)
+
+        # Preprocessing steps
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-        gray = cv2.medianBlur(gray, 3)
-        # optional dilation/erosion for thin fonts
-        kernel = np.ones((1, 1), np.uint8)
+        gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)  # Adaptive threshold
+        gray = cv2.medianBlur(gray, 3)  # Try medianBlur for better noise reduction
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)  # If still blurry, keep GaussianBlur
+
+        # Optional Morphological Transformations (adjust size if needed)
+        kernel = np.ones((2, 2), np.uint8)
         gray = cv2.dilate(gray, kernel, iterations=1)
         gray = cv2.erode(gray, kernel, iterations=1)
 
-        # Convert back to PIL for pytesseract
+        # CLAHE for contrast enhancement (optional, adjust clipLimit if needed)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+
+        # Otsu's Thresholding (or skip if using adaptive threshold)
+        _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Resize image for consistent OCR quality
+        height, width = gray.shape
+        new_width = 1500  # Adjust if necessary
+        aspect_ratio = width / height
+        new_height = int(new_width / aspect_ratio)
+        gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+
+        # Convert to PIL for OCR processing
         processed_pil = Image.fromarray(gray)
-        cv2.imwrite("processed_image.png", gray)  # for debugging
-        text = run_best_ocr(processed_pil)
+
+        # Save for debugging
+        cv2.imwrite("processed_image.png", gray)
+
+        # OCR with Tesseract
+        custom_config = r'--oem 3 --psm 6'
+        text = pytesseract.image_to_string(processed_pil, config=custom_config)
 
 
         if not text.strip():
@@ -189,7 +210,7 @@ def extract_items(lines):
 
 def deskew_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    coords = np.column_stack(np.where(gray < 255))
+    coords = np.column_stack(np.where(gray > 0))
     angle = cv2.minAreaRect(coords)[-1]
     if angle < -45:
         angle = -(90 + angle)
@@ -198,7 +219,8 @@ def deskew_image(img):
     (h, w) = img.shape[:2]
     center = (w // 2, h // 2)
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return img
 
 def run_best_ocr(img):
     best_text = ""
