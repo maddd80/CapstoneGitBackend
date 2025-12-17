@@ -54,10 +54,6 @@ def read_root():
     return {"message": "Welcome to Project-Based OCR API (Manual Category)!"}
 
 
-import numpy as np
-import cv2
-from PIL import Image
-
 # ==========================================
 # 🔧 HELPER FUNCTIONS (Geometry & Cleaning)
 # ==========================================
@@ -134,46 +130,47 @@ def preprocess_image_for_ocr(image_contents: bytes) -> tuple:
     if original_img is None: raise ValueError("Could not decode")
 
     # --- 2. Receipt Detection (Crop) ---
-    # (Keep your existing cropping logic here - it is working fine)
-    # ... [PASTE YOUR EXISTING CROP LOGIC HERE] ...
-    # For this snippet, I assume 'cropped_img' is ready:
-    cropped_img = original_img # <-- REPLACE THIS WITH YOUR CROP LOGIC
-
+    # [PASTE YOUR EXISTING CROP LOGIC HERE AS BEFORE]
+    cropped_img = original_img # Placeholder if you don't use the crop logic
+    
     # --- 3. Resize ---
     h, w = cropped_img.shape[:2]
+    # 1600 is good, but let's ensure we aren't stretching noise
     target_width = 1600
     if w < target_width:
         scale = target_width / w
         cropped_img = cv2.resize(cropped_img, (target_width, int(h * scale)), interpolation=cv2.INTER_CUBIC)
 
-    # --- 4. Clean Shadows (Aggressive) ---
+    # --- 4. Clean Shadows ---
     no_shadow = remove_shadows(cropped_img)
     gray = cv2.cvtColor(no_shadow, cv2.COLOR_BGR2GRAY)
 
-    # --- 5. Binarize (The Fix for "HOON ON Oe") ---
+    # --- 5. Binarize (The Fix) ---
     
-    # A. Median Blur: excellent for removing salt-and-pepper noise (watermark dots)
-    blurred = cv2.medianBlur(gray, 3) 
+    # A. Denoise
+    # Reduce sigma to 50 to preserve edges better
+    denoised = cv2.bilateralFilter(gray, 5, 50, 50)
     
-    # B. Adaptive Threshold with HIGHER Constant (C)
-    # Block Size 31, C=25 (Was 10). 
-    # This forces light-gray watermarks to become white (ignored), keeping only dark text.
+    # B. Adaptive Threshold 
+    # CHANGE: Lower C from 25 back to 11. 
+    # This keeps the light-gray thermal text visible.
     thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 25
+        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
     )
 
-    # --- 6. Morphological Cleanup ---
-    # Remove any remaining tiny dots
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
-    thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-
+    # --- 6. Morphological "Thickening" (The Magic Step) ---
+    
+    # CHANGE: Instead of MORPH_OPEN (which deletes noise/text), we use DILATE.
+    # This expands white pixels to "connect the dots" of the thermal print.
+    kernel = np.ones((2,2), np.uint8) # Small kernel to bridge gaps
+    thresh_thick = cv2.dilate(thresh, kernel, iterations=1)
+    
     # --- 7. Clean Borders & Crop ---
-    h_t, w_t = thresh_clean.shape
-    cv2.rectangle(thresh_clean, (0,0), (w_t, h_t), (255,255,255), 20) 
-    final_img = crop_to_text_content(thresh_clean, pad=20)
+    h_t, w_t = thresh_thick.shape
+    cv2.rectangle(thresh_thick, (0,0), (w_t, h_t), (255,255,255), 20) 
+    final_img = crop_to_text_content(thresh_thick, pad=20)
 
     return final_img, cropped_img
-
 
 
 # --- 🔥 DIPERBARUI: Fungsi "asisten" sync sekarang menerima 'category' ---
