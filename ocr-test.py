@@ -1,8 +1,28 @@
 import cv2
-import pytesseract
+
+try:
+    from paddleocr import PaddleOCR
+    ocr = PaddleOCR(use_angle_cls=True, lang='en')
+except Exception as e:
+    raise RuntimeError("PaddleOCR not available. Install with: pip install paddleocr paddlepaddle") from e
 
 img = cv2.imread("contoh_struk.jpg")
-gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+if img is None:
+    raise FileNotFoundError("contoh_struk.jpg not found")
 
-text = pytesseract.image_to_string(gray, config="--psm 6")
-print(text)
+result = ocr.ocr(img, cls=True)
+texts = []
+for line in result:
+    if isinstance(line, list):
+        for rec in line:
+            try:
+                texts.append(rec[1][0])
+            except Exception:
+                pass
+    else:
+        try:
+            texts.append(str(line))
+        except Exception:
+            pass
+
+print("\n".join(texts))

@@ -15,6 +15,9 @@ import tempfile
 import calendar
 
 # --- NEW: PADDLE OCR ---
+# Bypass model host connectivity check (may speed startup)
+# To override externally, set DISABLE_MODEL_SOURCE_CHECK in your environment first.
+os.environ.setdefault('DISABLE_MODEL_SOURCE_CHECK', 'True')
 from paddleocr import PaddleOCR
 
 # --- Firebase Setup ---
@@ -132,7 +135,7 @@ def process_and_save_sync_paddle(image_contents: bytes, filename: str, userId: s
         
         # B. Run PaddleOCR
         # result structure: [[[[box], [text, confidence]], ...]]
-        result = ocr_engine.ocr(img, cls=True)
+        result = ocr_engine.predict(img, cls=True)
         
         # C. Extract Text
         raw_lines = []

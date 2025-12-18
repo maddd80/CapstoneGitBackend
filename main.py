@@ -1,21 +1,18 @@
-import io
+from io import BytesIO
 import os
 import re
-import uuid
-import json
 import datetime
-import pytesseract
-import numpy as np
-import cv2
-from PIL import Image
+from PIL import Image, ImageOps
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-import subprocess 
+from functools import lru_cache
 import tempfile 
 import calendar
-
+import cv2
+import numpy as np
+from paddleocr import PaddleOCR
 # --- Firebase Setup ---
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -42,24 +39,165 @@ app = FastAPI(
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
-# --- 🔥 HAPUS FUNGSI KATEGORI (KARENA DIHANDLE FLUTTER) ---
-# CATEGORIES = { ... }
-# def get_category_from_text(text):
-#     ...
-# --- 🔥 AKHIR BLOK HAPUS ---
-
+# --- Bypass model host connectivity check (may speed startup) ---
+# To override externally, set DISABLE_MODEL_SOURCE_CHECK in your environment first.
+os.environ.setdefault('DISABLE_MODEL_SOURCE_CHECK', 'True')
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to Project-Based OCR API (Manual Category)!"}
 
+# ==========================================
+# 🚀 MAIN PREPROCESSOR
+# ==========================================
+@lru_cache(maxsize=1)
+def load_ocr_model():
+    """Load and cache PaddleOCR model"""
+    ocr = PaddleOCR(
+        text_detection_model_name="PP-OCRv5_mobile_det",
+        text_recognition_model_name="PP-OCRv5_mobile_rec",
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False, 
+        use_textline_orientation=False
+    )
+    return ocr
 
-# ==========================================
-# 🔧 HELPER FUNCTIONS (Geometry & Cleaning)
-# ==========================================
+
+def extract_text_from_json(result_json: dict):
+    """Extract text lines from OCR result JSON"""
+    rec_texts = result_json.get("res", {}).get('rec_texts', [])
+    if isinstance(rec_texts, list):
+        return rec_texts
+    return []
+
+
+def merge_split_lines(text: str) -> str:
+    """
+    Intelligently merge lines that OCR incorrectly split.
+    Handles cases like:
+    - TUNAI: \n 100,000 -> TUNAI: 100,000
+    - Product name \n qty price total -> Product name qty price total
+    """
+    lines = text.split('\n')
+    merged_lines = []
+    i = 0
+    
+    # Keywords that indicate this is NOT a product line
+    NON_ITEM_KEYWORDS = [
+        'TOTAL', 'TUNAI', 'KEMBALI', 'CUKAI', 'HARGA', 'BELANJA',
+        'LAYANAN', 'KONSUMEN', 'TELP', 'SMS', 'WA', 'SMSWA', 'KONTAK',
+        'EMAIL', 'WEBSITE', 'GRATIS', 'ONGKIR', 'KLIK', 'JAM', 
+        'TERIMA', 'KASIH', 'MUDAH', 'JUAL'
+    ]
+    
+    while i < len(lines):
+        current = lines[i].strip()
+        
+        # Skip empty lines
+        if not current:
+            i += 1
+            continue
+        
+        # Look ahead if there's a next line
+        if i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            
+            # ===== PATTERN 1: TOTAL/TUNAI/KEMBALI followed by amount =====
+            # Matches: "TUNAI:", "TOTAL BELANJA :", etc. followed by numbers
+            if re.match(r'^(TUNAI|KEMBALI|TOTAL|HARGA\s*JUAL|TOTAL\s*BELANJA)\s*:?\s*$', 
+                       current, re.IGNORECASE):
+                if next_line and re.match(r'^[\d,.\s]+$', next_line):
+                    merged_lines.append(f"{current} {next_line}")
+                    i += 2
+                    continue
+            
+            # ===== PATTERN 2: Product name followed by numbers =====
+            # Only merge if:
+            # - Current line has letters
+            # - Next line is only numbers
+            # - NOT a metadata line (date, transaction ID)
+            # - NOT a non-item keyword
+            if (re.search(r'[A-Z]', current) and 
+            len(current) > 5 and 
+            not any(kw in current.upper() for kw in NON_ITEM_KEYWORDS) and
+            not re.search(r'\d{2}\.\d{2}\.\d{2}', current) and
+            not re.search(r'[A-Z]\d+-\d+', current) and
+            not re.search(r'/[A-Z]+/\d+', current)):
+            
+                # Check if next 2 lines are numbers (qty price total pattern)
+                if (i + 2 < len(lines) and 
+                    re.match(r'^[\d,.\s]+$', lines[i + 1].strip()) and 
+                    re.match(r'^[\d,.\s]+$', lines[i + 2].strip())):
+                    merged_lines.append(f"{current} {lines[i + 1].strip()} {lines[i + 2].strip()}")
+                    i += 3
+                    continue
+        
+        # No merge needed, add current line as-is
+        merged_lines.append(current)
+        i += 1
+    
+    return '\n'.join(merged_lines)
+
+
+def fix_spacing_issues(text: str) -> str:
+    """
+    Fix OCR spacing mistakes while preserving line breaks.
+    Processes each line individually to maintain structure.
+    """
+    lines = text.split('\n')
+    fixed_lines = []
+    
+    for line in lines:
+        original_line = line
+        
+        # === STEP 1: Protect patterns that should NOT be modified ===
+        # Protect emails
+        line = re.sub(r'(\S+@\S+\.\S+)', 
+                     lambda m: m.group(1).replace('@', '<!AT!>').replace('.', '<!DOT!>'), 
+                     line)
+        
+        # Protect phone numbers (0811.1500.280, 08111500280, etc.)
+        line = re.sub(r'\b(\d{4}[\.\-]?\d{4}[\.\-]?\d{3,4})\b', 
+                     lambda m: m.group(1).replace('.', '<!DOT!>').replace('-', '<!DASH!>'), 
+                     line)
+        
+        # Protect reference numbers (NO.37, 4.0.26, JL.KELINCI)
+        line = re.sub(r'\b([A-Z]{2,}\.\d+)\b', 
+                     lambda m: m.group(1).replace('.', '<!DOT!>'), 
+                     line)
+        line = re.sub(r'\b(\d+\.\d+\.\d+)\b', 
+                     lambda m: m.group(1).replace('.', '<!DOT!>'), 
+                     line)
+        
+        # === STEP 2: Fix spacing issues ===
+        # Add space between letter and number (Item123 -> Item 123)
+        line = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', line)
+        
+        # Add space between number and letter for 2+ digit numbers (123Item -> 123 Item)
+        line = re.sub(r'(\d{2,})([A-Z][a-z])', r'\1 \2', line)
+        
+        # Add space after punctuation if missing (Item,Price -> Item, Price)
+        line = re.sub(r'([,;:])([A-Za-z])', r'\1 \2', line)
+        
+        # Fix merged quantity + price (238000 -> 2 38000)
+        # Only split if: digit(s) followed by 4-6 digit price
+        line = re.sub(r'\b([1-9])(\d{4,6})\b', r'\1 \2', line)
+        line = re.sub(r'\b([1-9]\d)(\d{4,6})\b', r'\1 \2', line)
+        
+        # Remove multiple spaces (but NOT newlines!)
+        line = re.sub(r' +', ' ', line)
+        
+        # === STEP 3: Restore protected patterns ===
+        line = line.replace('<!AT!>', '@')
+        line = line.replace('<!DOT!>', '.')
+        line = line.replace('<!DASH!>', '-')
+        
+        fixed_lines.append(line.strip())
+    
+    return '\n'.join(fixed_lines)
 
 def order_points(pts):
-    """Orders coordinates: top-left, top-right, bottom-right, bottom-left."""
+    """Order points: top-left, top-right, bottom-right, bottom-left"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -70,166 +208,144 @@ def order_points(pts):
     return rect
 
 def four_point_transform(image, pts):
-    """Transforms a skewed image into a flat, top-down view."""
+    """Perspective transform to straighten receipt"""
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
-
+    
     widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
     widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
     maxWidth = max(int(widthA), int(widthB))
-
+    
     heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
     heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
-
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-
+    
+    dst = np.array([[0, 0], [maxWidth - 1, 0], 
+                    [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
+    
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
-def remove_shadows(img):
-    """Normalizes lighting to remove shadows/glare."""
-    rgb_planes = cv2.split(img)
-    result_planes = []
-    for plane in rgb_planes:
-        dilated_img = cv2.dilate(plane, np.ones((7,7), np.uint8))
-        bg_img = cv2.medianBlur(dilated_img, 21)
-        diff_img = 255 - cv2.absdiff(plane, bg_img)
-        norm_img = cv2.normalize(diff_img, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
-        result_planes.append(norm_img)
-    return cv2.merge(result_planes)
-
-def crop_to_text_content(bin_img, pad=10):
-    """Crops white space around the text."""
-    inverted = cv2.bitwise_not(bin_img)
-    coords = cv2.findNonZero(inverted)
-    if coords is None: return bin_img
+def preprocess_receipt_image(image_pil):
+    """Detect and straighten receipt before OCR"""
+    import numpy as np
+    import cv2
     
-    x, y, w, h = cv2.boundingRect(coords)
-    h_img, w_img = bin_img.shape
+    # Convert PIL to OpenCV
+    img = np.array(image_pil)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     
-    x_new = max(0, x - pad)
-    y_new = max(0, y - pad)
-    w_new = min(w_img - x_new, w + 2*pad)
-    h_new = min(h_img - y_new, h + 2*pad)
+    # Resize for faster processing
+    height, width = img.shape[:2]
+    scale = 1.0
+    if width > 800:
+        scale = 800 / width
+        img = cv2.resize(img, None, fx=scale, fy=scale)
     
-    return bin_img[y_new:y_new+h_new, x_new:x_new+w_new]
-
-# ==========================================
-# 🚀 MAIN PREPROCESSOR
-# ==========================================
-
-def preprocess_image_for_ocr(image_contents: bytes) -> tuple:
-    # --- 1. Load Image ---
-    np_img = np.frombuffer(image_contents, np.uint8)
-    original_img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
-    if original_img is None: raise ValueError("Could not decode")
-
-    # --- 2. Receipt Detection (Crop) ---
-    # [PASTE YOUR EXISTING CROP LOGIC HERE AS BEFORE]
-    cropped_img = original_img # Placeholder if you don't use the crop logic
+    # Find receipt contour
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
     
-    # --- 3. Resize ---
-    h, w = cropped_img.shape[:2]
-    # 1600 is good, but let's ensure we aren't stretching noise
-    target_width = 1600
-    if w < target_width:
-        scale = target_width / w
-        cropped_img = cv2.resize(cropped_img, (target_width, int(h * scale)), interpolation=cv2.INTER_CUBIC)
-
-    # --- 4. Clean Shadows ---
-    no_shadow = remove_shadows(cropped_img)
-    gray = cv2.cvtColor(no_shadow, cv2.COLOR_BGR2GRAY)
-
-    # --- 5. Binarize (The Fix) ---
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
     
-    # A. Denoise
-    # Reduce sigma to 50 to preserve edges better
-    denoised = cv2.bilateralFilter(gray, 5, 50, 50)
+    # Find rectangular receipt
+    receipt_contour = None
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            receipt_contour = approx
+            break
     
-    # B. Adaptive Threshold 
-    # CHANGE: Lower C from 25 back to 11. 
-    # This keeps the light-gray thermal text visible.
-    thresh = cv2.adaptiveThreshold(
-        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
-    )
-
-    # --- 6. Morphological "Thickening" (The Magic Step) ---
+    # Apply perspective transform if receipt found
+    if receipt_contour is not None:
+        receipt_contour = receipt_contour.reshape(4, 2) / scale
+        # Convert back to original image
+        img_original = np.array(image_pil)
+        img_original = cv2.cvtColor(img_original, cv2.COLOR_RGB2BGR)
+        warped = four_point_transform(img_original, receipt_contour)
+        # Convert back to PIL
+        from PIL import Image
+        return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
     
-    # CHANGE: Instead of MORPH_OPEN (which deletes noise/text), we use DILATE.
-    # This expands white pixels to "connect the dots" of the thermal print.
-    kernel = np.ones((2,2), np.uint8) # Small kernel to bridge gaps
-    thresh_thick = cv2.dilate(thresh, kernel, iterations=1)
-    
-    # --- 7. Clean Borders & Crop ---
-    h_t, w_t = thresh_thick.shape
-    cv2.rectangle(thresh_thick, (0,0), (w_t, h_t), (255,255,255), 20) 
-    final_img = crop_to_text_content(thresh_thick, pad=20)
+    return image_pil
 
-    return final_img, cropped_img
-
-
-# --- 🔥 DIPERBARUI: Fungsi "asisten" sync sekarang menerima 'category' ---
-def process_and_save_sync(image_contents: bytes, filename: str, userId: str, projectId: str, category: str):
-    
-    tesseract_cmd_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    tessdata_path = r'C:\Program Files\Tesseract-OCR\tessdata'
+def process_and_save_sync(image_contents, filename: str, userId: str, projectId: str, category: str):
+    """
+    Main OCR processing function.
+    Steps:
+    1. Save image temporarily
+    2. Run OCR
+    3. Merge split lines
+    4. Fix spacing
+    5. Parse receipt data
+    6. Save to Firebase
+    """
     temp_image_path = None 
-
+    ocr_engine = load_ocr_model()
+    image_contents = preprocess_receipt_image(image_contents)
+    # Save PIL Image to temp file
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+        temp_image_path = temp_file.name
+        image_contents.save(temp_image_path)
+    
     try:
-        # --- 1. PREPROCESSING (The New Pipeline) ---
-        # Get the binarized image (final_img) AND the color crop (for potential future use)
-        final_img, _ = preprocess_image_for_ocr(image_contents)
-        cv2.imwrite('debug_cropped_img.png', _)  # Debugging line to save the preprocessed image
-        cv2.imwrite('debug_final_img.png', final_img)  # Debugging line to save the preprocessed image
-        processed_pil = Image.fromarray(final_img)
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_image_file:
-            temp_image_path = temp_image_file.name
-            processed_pil.save(temp_image_path)
-
-        # --- 2. TESSERACT CONFIGURATION (OPTIMIZED) ---
-        final_lang = 'ind+eng'
+        # === STEP 1: OCR INFERENCE ===
+        result = []
         
-        cmd = [
-            tesseract_cmd_path, 
-            temp_image_path, 
-            "stdout", 
-            "-l", final_lang, 
-            "--psm", "4",  # Single Column Variable
-            "-c", "preserve_interword_spaces=1", 
-            "-c", "tessedit_do_invert=0",
+        if ocr_engine is None:
+            raise RuntimeError("PaddleOCR not available")
+        
+        ocr_result = ocr_engine.predict(temp_image_path)
+        
+        # Extract text from OCR results
+        for i, res in enumerate(ocr_result):
+            result_json = res.json
+            text_lines = extract_text_from_json(result_json)
             
-            # --- NEW: NOISE REDUCTION ---
-            # Block typical noise characters often found in separators
-            "-c", "tessedit_char_blacklist=|[]{}«»~_—" 
-        ]
+            print(f"DEBUG - OCR result {i}: {len(text_lines)} lines detected")
+            
+            if isinstance(text_lines, list):
+                result.extend(text_lines)
+            else:
+                result.append(str(text_lines))
         
-        env = os.environ.copy()
-        env['TESSDATA_PREFIX'] = tessdata_path
+        # === STEP 2: CLEAN AND JOIN ===
+        clean_result = [str(line).strip() for line in result if line and str(line).strip()]
+        text = "\n".join(clean_result)
         
-        # Run Tesseract
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True, encoding='utf-8', env=env 
-        )
-        text = result.stdout
-        print("OCR Text Output:"+ text)
-        # Cleanup temp file immediately
-        if temp_image_path:
+        print(f"DEBUG - Total lines: {len(clean_result)}")
+        
+        # === STEP 3: MERGE SPLIT LINES ===
+        text = merge_split_lines(text)
+        
+        # === STEP 4: FIX SPACING ===
+        text = fix_spacing_issues(text)
+        
+        print("="*50)
+        print("OCR Text Output:")
+        print(text)
+        print("="*50)
+        
+        # Cleanup temp file
+        if temp_image_path and os.path.exists(temp_image_path):
             os.remove(temp_image_path)
-            temp_image_path = None 
+            temp_image_path = None
         
-        if not text.strip():
+        if not text:
             text = "Tidak ada teks terdeteksi."
-
-        # --- 3. PARSING ---
-        lines = text.splitlines()
-        parsed_data = parse_receipt_with_regex_v4_0(text) 
-
-        # --- 4. DATA PREPARATION ---
+        
+        # === STEP 5: PARSE RECEIPT ===
+        # You need to provide your parse_receipt_with_regex_v4_0 function
+        parsed_data = parse_receipt_with_regex_v4_0(text)
+        
+        print(f"DEBUG - Parsed merchant: {parsed_data.get('merchant')}")
+        print(f"DEBUG - Parsed total: {parsed_data.get('total_int')}")
+        print(f"DEBUG - Parsed items: {len(parsed_data.get('items', []))}")
+        
+        # === STEP 6: PREPARE DATA ===
         result_data = {
             "filename": filename,
             "merchant": parsed_data.get("merchant"),
@@ -241,28 +357,25 @@ def process_and_save_sync(image_contents: bytes, filename: str, userId: str, pro
             "tunai_string": parsed_data.get("tunai_str"),
             "kembali_string": parsed_data.get("kembali_str"),
             "items": parsed_data.get("items"),
-            # "raw_lines": lines, # Optional: Comment out to save DB space
-            "raw_text": text,   # Optional: Comment out to save DB space
+            "raw_text": text,
             "timestamp": datetime.datetime.now(datetime.timezone.utc),
             "uploadedBy": userId,
             "category": category
         }
         
-        # --- 5. FIREBASE SAVE ---
+        # === STEP 7: SAVE TO FIREBASE ===
         doc_ref = db.collection("projects").document(projectId).collection("expenses").document()
-        doc_ref.set(result_data) 
+        doc_ref.set(result_data)
         
         # Clean for response
-        result_data.pop("raw_lines", None)
-        # result_data.pop("raw_text", None)
         result_data["timestamp"] = result_data["timestamp"].isoformat()
-
+        
         return result_data
-
+    
     except Exception as e:
         import traceback
         print(traceback.format_exc())
-        raise e 
+        raise e
     
     finally:
         if temp_image_path and os.path.exists(temp_image_path):
@@ -281,8 +394,10 @@ async def extract_text_and_save(
         raise HTTPException(status_code=400, detail="userId, projectId, dan category tidak boleh kosong.")
 
     try:
-        contents = await image.read()
-
+        contents = Image.open(BytesIO(await image.read()))
+        contents = ImageOps.exif_transpose(contents)
+        contents.thumbnail((2000, 2000), Image.LANCZOS)
+        contents = contents.convert("RGB")
         result = await run_in_threadpool(
             process_and_save_sync, 
             image_contents=contents,
@@ -327,12 +442,12 @@ def parse_receipt_with_regex_v4_0(text):
     
     # UPDATED TOTAL PATTERN:
     # Matches: TOTAL, TOTAI, TWAL, T0TAL, TAGIHAN, JUMLAH, HARGA JUAL (Indomaret specific)
-    total_pattern = re.compile(r'(?i)(To[tTl][aA4]l?|TWAL|JUMLAH|TAGIHAN|HARGA\s*JUAL|GRAND\s*TOTAL)\s*[:\->\s|«;]*\s*([\d.,\s]+)')
+    total_pattern = re.compile(r'(?i)(To[tTl][aA4]l?|TWAL|JUMLAH|TAGIHAN|HARGA\s*JUAL|TOTAL\s*BELANJA|GRAND\s*TOTAL)\s+[:\->\s|«;]*\s*([\d.,\s]+)')
     
     # UPDATED TUNAI PATTERN:
     # Matches: TUNAI, TUMAI, TUHAI, CASH
     tunai_pattern = re.compile(r'(?i)(TU[NMH]AI|CASH|BAYAR|DIBAYAR)\s*[:\->\s|«;]*\s*([\d.,\s]+)')
-    kembali_pattern = re.compile(r'(?i)(KEMBA[LI]?|CHANGE)\s*[:\->\s|«;]*\s*([\d.,\s]+)')
+    kembali_pattern = re.compile(r'(?i)(KEMBALI|KEMBAL|KEMBA|CHANGE)\s*[:\->\s|«;]*\s*([\d.,\s]+)')
 
     date_pattern_1 = re.compile(r'(\d{2}/\d{2}/\d{4})') 
     date_pattern_2 = re.compile(r'(\d{2}\.\d{2}\.\d{2,4})')
@@ -346,8 +461,18 @@ def parse_receipt_with_regex_v4_0(text):
     item_pattern_3 = re.compile(r'^([a-zA-Z][a-zA-Z\s./-]{3,})\s+([\d.,]{3,})$')
     item_pattern_4 = re.compile(r'^(\d+)\s+(.+?)\s+(\d+)\s+([\d.,]+)\s+(?:[\d.,]+\s+)?([\d.,]+)$')
 
-    FILTER_KEYWORDS = ["TOTAL", "TUNAI", "KEMBALI", "PPN", "TAX", "SUBTOTAL", "DISKON", "NPWP", "HARGA JUAL", "ITEM", "CASHIER", "ADMINISTRATOR"]
-    
+    FILTER_KEYWORDS = [
+        "TOTAL", "TUNAI", "KEMBALI", "PPN", "TAX", "SUBTOTAL", "DISKON", "NPWP", 
+        "HARGA JUAL", "ITEM", "CASHIER", "ADMINISTRATOR",
+        # Contact & Service info
+        "LAYANAN", "KONSUMEN", "TELP", "SMS", "WA", "SMSWA", "CONTACT", "KONTAK",
+        "EMAIL", "@", "WEBSITE", "WWW", "HTTP",
+        # Promotional text
+        "GRATIS", "ONGKIR", "BELANJA", "KLIK", "JAM SAMPAI", "TERIMA KASIH", 
+        "THANK YOU", "SELAMAT", "MUDAH",
+        # Receipt metadata
+        "CUKAI", "NO #", "STRUK", "RECEIPT", "TANGGAL", "DATE"
+    ]
     for line in lines:
         line_clean = line.strip()
         if not merchant and len(line_clean) > 3 and any(c.isalpha() for c in line_clean):
@@ -395,7 +520,10 @@ def parse_receipt_with_regex_v4_0(text):
         is_keyword = any(keyword in line.upper() for keyword in FILTER_KEYWORDS)
         if is_keyword:
             continue 
-
+        if re.search(r'\d{4}[\.\-]?\d{4}[\.\-]?\d{3,4}', line):  # Phone pattern
+            continue
+        if '@' in line or 'WWW' in line.upper() or 'HTTP' in line.upper():  # Email/URL
+            continue
         match_4 = item_pattern_4.search(line)
         if match_4:
             try:
