@@ -342,6 +342,91 @@ def ocr_pil_images(pil_images, ocr_engine):
     print(texts)
     return texts
 
+def parse_merchant(info_texts):
+    for line in info_texts:
+        line = line.strip()
+        if len(line) > 3 and any(c.isalpha() for c in line):
+            return line
+    return None
+
+def parse_total(total_texts):
+    for line in total_texts:
+        m = re.search(r'([\d]{1,3}(?:[.,]\d{3})+)', line)
+        if m:
+            return clean_price(m.group(1))
+    return 0
+
+def group_item_blocks(lines):
+    items = []
+    i = 0
+
+    while i < len(lines):
+        name = lines[i].strip()
+        if not name or re.fullmatch(r'[\d.,Xx×]+', name):
+            i += 1
+            continue
+
+        qty = 1
+        unit_price = None
+        total_price = None
+
+        # unit price
+        if i+1 < len(lines) and re.fullmatch(r'[\d.,]+', lines[i+1]):
+            unit_price = clean_price(lines[i+1])
+            i += 1
+
+        # qty marker (X1, ×1)
+        if i+1 < len(lines) and re.fullmatch(r'[Xx×]\s*\d+', lines[i+1]):
+            qty = int(re.sub(r'\D', '', lines[i+1]))
+            i += 1
+
+        # total price
+        if i+1 < len(lines) and re.fullmatch(r'[\d.,]+', lines[i+1]):
+            total_price = clean_price(lines[i+1])
+            i += 1
+
+        if total_price is None and unit_price is not None:
+            total_price = unit_price * qty
+
+        items.append({
+            "name": name,
+            "qty": qty,
+            "unit_price": unit_price,
+            "price": total_price
+        })
+
+        i += 1
+
+    return items
+
+
+def normalize_item_lines(lines):
+    merged = []
+    buffer = ""
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # line is price-only
+        if re.fullmatch(r'[\d.,]+', line):
+            buffer += " " + line
+            merged.append(buffer.strip())
+            buffer = ""
+        else:
+            if buffer:
+                merged.append(buffer.strip())
+            buffer = line
+
+    if buffer:
+        merged.append(buffer.strip())
+
+    return merged
+
+def parse_items(item_texts):
+    return group_item_blocks(item_texts)
+
 CLASS_MAP = {
     "info_toko": 0,
     "item_belanja": 1,
@@ -362,6 +447,7 @@ def process_and_save_sync(image_contents, filename: str, userId: str, projectId:
     """
     temp_image_path = None 
     ocr_engine = load_ocr_model()
+    struk = detect_and_crop_receipt(image_contents)
     regions = detect_and_crop_all_by_class(image_contents)
 
 
@@ -380,51 +466,42 @@ def process_and_save_sync(image_contents, filename: str, userId: str, projectId:
     
     try:
         # === STEP 1: OCR INFERENCE ===
-        result = []
+        # result = []
         if ocr_engine is None:
             raise RuntimeError("PaddleOCR not available")
         
         info_texts  = ocr_pil_images(info_imgs, ocr_engine)
         item_texts  = ocr_pil_images(item_imgs, ocr_engine)
         total_texts = ocr_pil_images(total_imgs, ocr_engine)
+        # text = ocr_pil_images(struk,ocr_engine)
 
-        all_lines = info_texts + item_texts + total_texts
-        all_lines = [l.strip() for l in all_lines if l.strip()]
-
-        text = "\n".join(all_lines)
-        text = merge_split_lines(text)
-        text = fix_spacing_issues(text)
-        
+        merchant = parse_merchant(info_texts)
+        items    = parse_items(item_texts)
+        total    = parse_total(total_texts)
         print("="*50)
         print("OCR Text Output:")
-        print(text)
+        # print(text)
         print("="*50)
-        
-        # Cleanup temp file
-        if not text:
-            text = "Tidak ada teks terdeteksi."
+    
         
         # === STEP 5: PARSE RECEIPT ===
         # You need to provide your parse_receipt_with_regex_v4_0 function
-        parsed_data = parse_receipt_with_regex_v4_0(text)
         
-        print(f"DEBUG - Parsed merchant: {parsed_data.get('merchant')}")
-        print(f"DEBUG - Parsed total: {parsed_data.get('total_int')}")
-        print(f"DEBUG - Parsed items: {len(parsed_data.get('items', []))}")
-        
+        print(f"DEBUG - Parsed merchant: {merchant}")
+        print(f"DEBUG - Parsed total: {total}")
+        print(f"DEBUG - Parsed items: {len(items)}")
+        if int(total) == 0 and items:
+            total_int = sum(i["price"] for i in items if i.get("price"))
+            total = str(total_int)
+
         # # === STEP 6: PREPARE DATA ===
         result_data = {
             "filename": filename,
-            "merchant": parsed_data.get('merchant'),
-            "date": parsed_data.get("date"),
-            "total": parsed_data.get('total_int'),
-            "total_string": parsed_data.get("total_str"),
-            "tunai": parsed_data.get("tunai_int"),
-            "kembali": parsed_data.get("kembali_int"),
-            "tunai_string": parsed_data.get("tunai_str"),
-            "kembali_string": parsed_data.get("kembali_str"),
-            "items": parsed_data.get('items', []),
-            "raw_text": text,
+            "merchant": merchant,
+            "total": int(total),
+            "total_string": total,
+            "items": items,
+            "raw_text": f"Info: {info_texts}\nitems: {item_texts}\ntotal: {total_texts}\n",
             "timestamp": datetime.datetime.now(datetime.timezone.utc),
             "uploadedBy": userId,
             "category": category
