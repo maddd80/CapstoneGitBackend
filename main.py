@@ -384,9 +384,6 @@ def process_and_save_sync(image_contents, filename: str, userId: str, projectId:
         if ocr_engine is None:
             raise RuntimeError("PaddleOCR not available")
         
-        total_texts = ocr_pil_images(total_imgs, ocr_engine)
-        item_texts  = ocr_pil_images(item_imgs, ocr_engine)
-        info_texts  = ocr_pil_images(info_imgs, ocr_engine)
         info_texts  = ocr_pil_images(info_imgs, ocr_engine)
         item_texts  = ocr_pil_images(item_imgs, ocr_engine)
         total_texts = ocr_pil_images(total_imgs, ocr_engine)
@@ -418,15 +415,15 @@ def process_and_save_sync(image_contents, filename: str, userId: str, projectId:
         # # === STEP 6: PREPARE DATA ===
         result_data = {
             "filename": filename,
-            "merchant": info_texts,
+            "merchant": parsed_data.get('merchant'),
             "date": parsed_data.get("date"),
-            "total": total_texts,
+            "total": parsed_data.get('total_int'),
             "total_string": parsed_data.get("total_str"),
             "tunai": parsed_data.get("tunai_int"),
             "kembali": parsed_data.get("kembali_int"),
             "tunai_string": parsed_data.get("tunai_str"),
             "kembali_string": parsed_data.get("kembali_str"),
-            "items": item_texts,
+            "items": parsed_data.get('items', []),
             "raw_text": text,
             "timestamp": datetime.datetime.now(datetime.timezone.utc),
             "uploadedBy": userId,
@@ -440,7 +437,7 @@ def process_and_save_sync(image_contents, filename: str, userId: str, projectId:
         # Clean for response
         result_data["timestamp"] = result_data["timestamp"].isoformat()
         
-        return "LALALAL"
+        return result_data
     
     except Exception as e:
         import traceback
