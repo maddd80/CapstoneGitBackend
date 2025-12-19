@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 4
+names: ['info_toko', 'item_belanja', 'struk_belanja', 'total']
+
+roboflow:
+  workspace: ocr-struk-belanja-gpcd0
+  project: ocr-struk-belanja-mx7qi
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/ocr-struk-belanja-gpcd0/ocr-struk-belanja-mx7qi/dataset/2

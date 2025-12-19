@@ -16,8 +16,7 @@ import calendar
 
 # --- NEW: PADDLE OCR ---
 # Bypass model host connectivity check (may speed startup)
-# To override externally, set DISABLE_MODEL_SOURCE_CHECK in your environment first.
-os.environ.setdefault('DISABLE_MODEL_SOURCE_CHECK', 'True')
+
 from paddleocr import PaddleOCR
 
 # --- Firebase Setup ---

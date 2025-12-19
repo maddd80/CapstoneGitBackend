@@ -12,6 +12,7 @@ import tempfile
 import calendar
 import cv2
 import numpy as np
+from ultralytics import YOLO
 from paddleocr import PaddleOCR
 # --- Firebase Setup ---
 import firebase_admin
@@ -50,6 +51,11 @@ def read_root():
 # ==========================================
 # 🚀 MAIN PREPROCESSOR
 # ==========================================
+
+@lru_cache(maxsize=1)
+def load_yolo_model():
+    return YOLO("dataset/runs/detect/train3/weights/best.pt")
+
 @lru_cache(maxsize=1)
 def load_ocr_model():
     """Load and cache PaddleOCR model"""
@@ -272,6 +278,77 @@ def preprocess_receipt_image(image_pil):
     
     return image_pil
 
+def detect_and_crop_receipt(image_pil):
+    model = load_yolo_model()
+
+    img = np.array(image_pil)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    results = model(img, conf=0.25)[0]
+
+    if not results.boxes:
+        return image_pil  # fallback if YOLO fails
+
+    # take the largest box (receipt)
+    boxes = results.boxes.xyxy.cpu().numpy()
+    areas = [(x2-x1)*(y2-y1) for x1,y1,x2,y2 in boxes]
+    x1,y1,x2,y2 = boxes[int(np.argmax(areas))].astype(int)
+
+    crop = img[y1:y2, x1:x2]
+    crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    cv2.imwrite("tesyolo.png", crop)
+    return Image.fromarray(crop)
+
+def detect_and_crop_all_by_class(image_pil):
+    model = load_yolo_model()
+
+    img = np.array(image_pil)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    results = model(img, conf=0.25)[0]
+
+    outputs = {}
+
+    if not results.boxes:
+        return outputs
+
+    boxes = results.boxes.xyxy.cpu().numpy()
+    classes = results.boxes.cls.cpu().numpy().astype(int)
+
+    for box, cls in zip(boxes, classes):
+        x1,y1,x2,y2 = box.astype(int)
+        crop = img[y1:y2, x1:x2]
+        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        outputs.setdefault(cls, []).append(Image.fromarray(crop))
+
+    return outputs
+
+def ocr_pil_images(pil_images, ocr_engine):
+    texts = []
+
+    for img in pil_images:
+        img_np = np.array(img)  # RGB numpy
+        result = ocr_engine.predict(img_np)
+        for i, res in enumerate(result):
+            result_json = res.json
+            text_lines = extract_text_from_json(result_json)
+            
+            print(f"DEBUG - OCR result {i}: {len(text_lines)} lines detected")
+            
+            if isinstance(text_lines, list):
+                texts.extend(text_lines)
+            else:
+                texts.append(str(text_lines))
+    print(texts)
+    return texts
+
+CLASS_MAP = {
+    "info_toko": 0,
+    "item_belanja": 1,
+    "struk_belanja": 2,
+    "total": 3
+}
+
 def process_and_save_sync(image_contents, filename: str, userId: str, projectId: str, category: str):
     """
     Main OCR processing function.
@@ -285,43 +362,40 @@ def process_and_save_sync(image_contents, filename: str, userId: str, projectId:
     """
     temp_image_path = None 
     ocr_engine = load_ocr_model()
-    image_contents = preprocess_receipt_image(image_contents)
+    regions = detect_and_crop_all_by_class(image_contents)
+
+
+    info_imgs = regions.get(CLASS_MAP["info_toko"], [])
+    item_imgs = regions.get(CLASS_MAP["item_belanja"], [])
+    total_imgs = regions.get(CLASS_MAP["total"], [])
+    if info_imgs:
+        info_imgs[0].save("info.jpg")
+
+    if item_imgs:
+        item_imgs[0].save("item.jpg")
+
+    if total_imgs:
+        total_imgs[0].save("total.jpg")
     # Save PIL Image to temp file
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-        temp_image_path = temp_file.name
-        image_contents.save(temp_image_path)
     
     try:
         # === STEP 1: OCR INFERENCE ===
         result = []
-        
         if ocr_engine is None:
             raise RuntimeError("PaddleOCR not available")
         
-        ocr_result = ocr_engine.predict(temp_image_path)
-        
-        # Extract text from OCR results
-        for i, res in enumerate(ocr_result):
-            result_json = res.json
-            text_lines = extract_text_from_json(result_json)
-            
-            print(f"DEBUG - OCR result {i}: {len(text_lines)} lines detected")
-            
-            if isinstance(text_lines, list):
-                result.extend(text_lines)
-            else:
-                result.append(str(text_lines))
-        
-        # === STEP 2: CLEAN AND JOIN ===
-        clean_result = [str(line).strip() for line in result if line and str(line).strip()]
-        text = "\n".join(clean_result)
-        
-        print(f"DEBUG - Total lines: {len(clean_result)}")
-        
-        # === STEP 3: MERGE SPLIT LINES ===
+        total_texts = ocr_pil_images(total_imgs, ocr_engine)
+        item_texts  = ocr_pil_images(item_imgs, ocr_engine)
+        info_texts  = ocr_pil_images(info_imgs, ocr_engine)
+        info_texts  = ocr_pil_images(info_imgs, ocr_engine)
+        item_texts  = ocr_pil_images(item_imgs, ocr_engine)
+        total_texts = ocr_pil_images(total_imgs, ocr_engine)
+
+        all_lines = info_texts + item_texts + total_texts
+        all_lines = [l.strip() for l in all_lines if l.strip()]
+
+        text = "\n".join(all_lines)
         text = merge_split_lines(text)
-        
-        # === STEP 4: FIX SPACING ===
         text = fix_spacing_issues(text)
         
         print("="*50)
@@ -330,10 +404,6 @@ def process_and_save_sync(image_contents, filename: str, userId: str, projectId:
         print("="*50)
         
         # Cleanup temp file
-        if temp_image_path and os.path.exists(temp_image_path):
-            os.remove(temp_image_path)
-            temp_image_path = None
-        
         if not text:
             text = "Tidak ada teks terdeteksi."
         
@@ -345,41 +415,37 @@ def process_and_save_sync(image_contents, filename: str, userId: str, projectId:
         print(f"DEBUG - Parsed total: {parsed_data.get('total_int')}")
         print(f"DEBUG - Parsed items: {len(parsed_data.get('items', []))}")
         
-        # === STEP 6: PREPARE DATA ===
+        # # === STEP 6: PREPARE DATA ===
         result_data = {
             "filename": filename,
-            "merchant": parsed_data.get("merchant"),
+            "merchant": info_texts,
             "date": parsed_data.get("date"),
-            "total": parsed_data.get("total_int"),
+            "total": total_texts,
             "total_string": parsed_data.get("total_str"),
             "tunai": parsed_data.get("tunai_int"),
             "kembali": parsed_data.get("kembali_int"),
             "tunai_string": parsed_data.get("tunai_str"),
             "kembali_string": parsed_data.get("kembali_str"),
-            "items": parsed_data.get("items"),
+            "items": item_texts,
             "raw_text": text,
             "timestamp": datetime.datetime.now(datetime.timezone.utc),
             "uploadedBy": userId,
             "category": category
         }
         
-        # === STEP 7: SAVE TO FIREBASE ===
+        # # === STEP 7: SAVE TO FIREBASE ===
         doc_ref = db.collection("projects").document(projectId).collection("expenses").document()
         doc_ref.set(result_data)
         
         # Clean for response
         result_data["timestamp"] = result_data["timestamp"].isoformat()
         
-        return result_data
+        return "LALALAL"
     
     except Exception as e:
         import traceback
         print(traceback.format_exc())
         raise e
-    
-    finally:
-        if temp_image_path and os.path.exists(temp_image_path):
-            os.remove(temp_image_path)
 
 @app.post("/extract-text/", response_class=JSONResponse)
 async def extract_text_and_save( 

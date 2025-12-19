@@ -2,3 +2,6 @@
 __pycache__/
 /data
 capstone-ad4dc-firebase-adminsdk-fbsvc-3005a411f0.json
+/dataset/test
+/dataset/train
+/dataset/valid
