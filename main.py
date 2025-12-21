@@ -132,64 +132,6 @@ def load_ocr_model() -> PaddleOCR:
 # IMAGE PROCESSING UTILITIES
 # ==========================================
 
-def order_points(pts: np.ndarray) -> np.ndarray:
-    """Order points: top-left, top-right, bottom-right, bottom-left"""
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-
-def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Apply perspective transform to straighten receipt"""
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]
-    ], dtype="float32")
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-
-
-def detect_and_crop_receipt(image_pil: Image.Image) -> Image.Image:
-    """Detect receipt using YOLO and crop to the largest detected box"""
-    model = load_yolo_model()
-    img = np.array(image_pil)
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-    results = model(img, conf=0.25)[0]
-
-    if not results.boxes:
-        return image_pil
-
-    # Get the largest box
-    boxes = results.boxes.xyxy.cpu().numpy()
-    areas = [(x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in boxes]
-    x1, y1, x2, y2 = boxes[int(np.argmax(areas))].astype(int)
-
-    crop = img[y1:y2, x1:x2]
-    crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    
-    return Image.fromarray(crop)
-
-
 def detect_and_crop_all_by_class(image_pil: Image.Image) -> Dict[int, List[Image.Image]]:
     """Detect and crop all receipt regions by class (info, items, total)"""
     model = load_yolo_model()
@@ -241,90 +183,7 @@ def ocr_pil_images(pil_images: List[Image.Image], ocr_engine: PaddleOCR) -> List
     
     return texts
 
-
-def merge_split_lines(text: str) -> str:
-    """
-    Intelligently merge lines that OCR incorrectly split.
-    Example: "TUNAI: \\n 100,000" -> "TUNAI: 100,000"
-    """
-    lines = text.split('\n')
-    merged_lines = []
-    i = 0
-
-    while i < len(lines):
-        current = lines[i].strip()
-
-        if not current:
-            i += 1
-            continue
-
-        if i + 1 < len(lines):
-            next_line = lines[i + 1].strip()
-
-            # Pattern 1: TOTAL/TUNAI/KEMBALI followed by amount
-            if re.match(r'^(TUNAI|KEMBALI|TOTAL|HARGA\s*JUAL|TOTAL\s*BELANJA)\s*:?\s*$',
-                       current, re.IGNORECASE):
-                if next_line and re.match(r'^[\d,.\s]+$', next_line):
-                    merged_lines.append(f"{current} {next_line}")
-                    i += 2
-                    continue
-
-            # Pattern 2: Product name followed by numbers
-            if (re.search(r'[A-Z]', current) and
-                len(current) > 5 and
-                not any(kw in current.upper() for kw in NON_ITEM_KEYWORDS) and
-                not re.search(r'\d{2}\.\d{2}\.\d{2}', current) and
-                not re.search(r'[A-Z]\d+-\d+', current) and
-                not re.search(r'/[A-Z]+/\d+', current)):
-
-                if (i + 2 < len(lines) and
-                    re.match(r'^[\d,.\s]+$', lines[i + 1].strip()) and
-                    re.match(r'^[\d,.\s]+$', lines[i + 2].strip())):
-                    merged_lines.append(f"{current} {lines[i + 1].strip()} {lines[i + 2].strip()}")
-                    i += 3
-                    continue
-
-        merged_lines.append(current)
-        i += 1
-
-    return '\n'.join(merged_lines)
-
-
-def fix_spacing_issues(text: str) -> str:
-    """Fix OCR spacing mistakes while preserving line breaks"""
-    lines = text.split('\n')
-    fixed_lines = []
-
-    for line in lines:
-        # Protect patterns that should NOT be modified
-        line = re.sub(r'(\S+@\S+\.\S+)',
-                     lambda m: m.group(1).replace('@', '<!AT!>').replace('.', '<!DOT!>'),
-                     line)
-        line = re.sub(r'\b(\d{4}[\.\-]?\d{4}[\.\-]?\d{3,4})\b',
-                     lambda m: m.group(1).replace('.', '<!DOT!>').replace('-', '<!DASH!>'),
-                     line)
-        line = re.sub(r'\b([A-Z]{2,}\.\d+)\b',
-                     lambda m: m.group(1).replace('.', '<!DOT!>'),
-                     line)
-
-        # Fix spacing issues
-        line = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', line)
-        line = re.sub(r'(\d{2,})([A-Z][a-z])', r'\1 \2', line)
-        line = re.sub(r'([,;:])([A-Za-z])', r'\1 \2', line)
-        line = re.sub(r'\b([1-9])(\d{4,6})\b', r'\1 \2', line)
-        line = re.sub(r' +', ' ', line)
-
-        # Restore protected patterns
-        line = line.replace('<!AT!>', '@')
-        line = line.replace('<!DOT!>', '.')
-        line = line.replace('<!DASH!>', '-')
-
-        fixed_lines.append(line.strip())
-
-    return '\n'.join(fixed_lines)
-
-
-# ==========================================
+#==========================================
 # RECEIPT PARSING
 # ==========================================
 
@@ -547,4 +406,4 @@ async def extract_text_and_save(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
